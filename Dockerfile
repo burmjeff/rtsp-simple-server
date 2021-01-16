@@ -21,4 +21,4 @@ RUN wget https://github.com/aler9/rtsp-simple-server/releases/download/v0.13.2/r
 # ports and volumes
 VOLUME /config
 EXPOSE 8554
-CMD ["rtsp-simple-server", "run", "/config/rtsp-simple-server.yml"]
+CMD ["rtsp-simple-server", "/config/rtsp-simple-server.yml"]
