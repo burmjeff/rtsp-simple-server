@@ -7,12 +7,13 @@ PROXY_PROTOCOL=tcp
 # source
 
 CONF=""
-CONF="${CONF}rtspPort: 8555\n"
-CONF="${CONF}rtpPort: 8002\n"
-CONF="${CONF}rtcpPort: 8003\n"
+CONF="${CONF}hlsDisable: yes\n"
+CONF="${CONF}rtspAddress: :8555\n"
+CONF="${CONF}rtpAddress: :8002\n"
+CONF="${CONF}rtcpAddress: :8003\n"
 echo -e "$CONF" > /source.conf
 
-/rtsp-simple-server /source.conf &
+RTSP_RTMPDISABLE=yes /rtsp-simple-server /source.conf &
 
 sleep 1
 
@@ -25,6 +26,7 @@ sleep 1
 # proxy
 
 CONF=""
+CONF="${CONF}hlsDisable: yes\n"
 CONF="${CONF}pprof: yes\n"
 CONF="${CONF}paths:\n"
 for i in $(seq 1 $PROXY_COUNT); do
@@ -34,7 +36,7 @@ for i in $(seq 1 $PROXY_COUNT); do
 done
 echo -e "$CONF" > /proxy.conf
 
-/rtsp-simple-server /proxy.conf &
+RTSP_RTMPDISABLE=yes /rtsp-simple-server /proxy.conf &
 
 sleep 5
 

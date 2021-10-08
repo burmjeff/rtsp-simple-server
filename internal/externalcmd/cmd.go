@@ -5,7 +5,7 @@ import (
 )
 
 const (
-	retryPause = 5 * time.Second
+	restartPause = 5 * time.Second
 )
 
 // Environment is a Cmd environment.
@@ -38,6 +38,7 @@ func New(cmdstr string, restart bool, env Environment) *Cmd {
 	}
 
 	go e.run()
+
 	return e
 }
 
@@ -62,11 +63,8 @@ func (e *Cmd) run() {
 				return false
 			}
 
-			t := time.NewTimer(retryPause)
-			defer t.Stop()
-
 			select {
-			case <-t.C:
+			case <-time.After(restartPause):
 				return true
 			case <-e.terminate:
 				return false

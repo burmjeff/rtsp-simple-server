@@ -2,28 +2,18 @@ package conf
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"reflect"
 	"time"
 
-	"github.com/aler9/gortsplib"
 	"github.com/aler9/gortsplib/pkg/headers"
 	"golang.org/x/crypto/nacl/secretbox"
 	"gopkg.in/yaml.v2"
 
-	"github.com/aler9/rtsp-simple-server/internal/confenv"
 	"github.com/aler9/rtsp-simple-server/internal/logger"
-)
-
-// Encryption is an encryption policy.
-type Encryption int
-
-// encryption policies.
-const (
-	EncryptionNo Encryption = iota
-	EncryptionOptional
-	EncryptionStrict
 )
 
 func decrypt(key string, byts []byte) ([]byte, error) {
@@ -45,169 +35,302 @@ func decrypt(key string, byts []byte) ([]byte, error) {
 	return decrypted, nil
 }
 
-// Conf is the main program configuration.
-type Conf struct {
-	LogLevel              string                                `yaml:"logLevel"`
-	LogLevelParsed        logger.Level                          `yaml:"-" json:"-"`
-	LogDestinations       []string                              `yaml:"logDestinations"`
-	LogDestinationsParsed map[logger.Destination]struct{}       `yaml:"-" json:"-"`
-	LogFile               string                                `yaml:"logFile"`
-	Protocols             []string                              `yaml:"protocols"`
-	ProtocolsParsed       map[gortsplib.StreamProtocol]struct{} `yaml:"-" json:"-"`
-	Encryption            string                                `yaml:"encryption"`
-	EncryptionParsed      Encryption                            `yaml:"-" json:"-"`
-	ListenIP              string                                `yaml:"listenIP"`
-	RtspPort              int                                   `yaml:"rtspPort"`
-	RtspsPort             int                                   `yaml:"rtspsPort"`
-	RTPPort               int                                   `yaml:"rtpPort"`
-	RTCPPort              int                                   `yaml:"rtcpPort"`
-	ServerKey             string                                `yaml:"serverKey"`
-	ServerCert            string                                `yaml:"serverCert"`
-	AuthMethods           []string                              `yaml:"authMethods"`
-	AuthMethodsParsed     []headers.AuthMethod                  `yaml:"-" json:"-"`
-	ReadTimeout           time.Duration                         `yaml:"readTimeout"`
-	WriteTimeout          time.Duration                         `yaml:"writeTimeout"`
-	ReadBufferCount       uint64                                `yaml:"readBufferCount"`
-	Metrics               bool                                  `yaml:"metrics"`
-	Pprof                 bool                                  `yaml:"pprof"`
-	RunOnConnect          string                                `yaml:"runOnConnect"`
-	RunOnConnectRestart   bool                                  `yaml:"runOnConnectRestart"`
-	Paths                 map[string]*PathConf                  `yaml:"paths"`
+func loadFromFile(fpath string, conf *Conf) (bool, error) {
+	// rtsp-simple-server.yml is optional
+	// other configuration files are not
+	if fpath == "rtsp-simple-server.yml" {
+		if _, err := os.Stat(fpath); err != nil {
+			return false, nil
+		}
+	}
+
+	byts, err := ioutil.ReadFile(fpath)
+	if err != nil {
+		return true, err
+	}
+
+	if key, ok := os.LookupEnv("RTSP_CONFKEY"); ok {
+		byts, err = decrypt(key, byts)
+		if err != nil {
+			return true, err
+		}
+	}
+
+	// load YAML config into a generic map
+	var temp interface{}
+	err = yaml.Unmarshal(byts, &temp)
+	if err != nil {
+		return true, err
+	}
+
+	// convert interface{} keys into string keys to avoid JSON errors
+	var convert func(i interface{}) interface{}
+	convert = func(i interface{}) interface{} {
+		switch x := i.(type) {
+		case map[interface{}]interface{}:
+			m2 := map[string]interface{}{}
+			for k, v := range x {
+				m2[k.(string)] = convert(v)
+			}
+			return m2
+
+		case []interface{}:
+			a2 := make([]interface{}, len(x))
+			for i, v := range x {
+				a2[i] = convert(v)
+			}
+			return a2
+		}
+
+		return i
+	}
+	temp = convert(temp)
+
+	// check for non-existent parameters
+	var checkNonExistentFields func(what interface{}, ref interface{}) error
+	checkNonExistentFields = func(what interface{}, ref interface{}) error {
+		if what == nil {
+			return nil
+		}
+
+		ma, ok := what.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("not a map")
+		}
+
+		for k, v := range ma {
+			fi := func() reflect.Type {
+				rr := reflect.TypeOf(ref)
+				for i := 0; i < rr.NumField(); i++ {
+					f := rr.Field(i)
+					if f.Tag.Get("json") == k {
+						return f.Type
+					}
+				}
+				return nil
+			}()
+			if fi == nil {
+				return fmt.Errorf("non-existent parameter: '%s'", k)
+			}
+
+			if fi == reflect.TypeOf(map[string]*PathConf{}) && v != nil {
+				ma2, ok := v.(map[string]interface{})
+				if !ok {
+					return fmt.Errorf("parameter %s is not a map", k)
+				}
+
+				for k2, v2 := range ma2 {
+					err := checkNonExistentFields(v2, reflect.Zero(fi.Elem().Elem()).Interface())
+					if err != nil {
+						return fmt.Errorf("parameter %s, key %s: %s", k, k2, err)
+					}
+				}
+			}
+		}
+		return nil
+	}
+	err = checkNonExistentFields(temp, Conf{})
+	if err != nil {
+		return true, err
+	}
+
+	// convert the generic map into JSON
+	byts, err = json.Marshal(temp)
+	if err != nil {
+		return true, err
+	}
+
+	// load the configuration from JSON
+	err = json.Unmarshal(byts, conf)
+	if err != nil {
+		return true, err
+	}
+
+	return true, nil
 }
 
-func (conf *Conf) fillAndCheck() error {
-	if conf.LogLevel == "" {
-		conf.LogLevel = "info"
+// Conf is a configuration.
+type Conf struct {
+	// general
+	LogLevel            LogLevel        `json:"logLevel"`
+	LogDestinations     LogDestinations `json:"logDestinations"`
+	LogFile             string          `json:"logFile"`
+	ReadTimeout         StringDuration  `json:"readTimeout"`
+	WriteTimeout        StringDuration  `json:"writeTimeout"`
+	ReadBufferCount     int             `json:"readBufferCount"`
+	API                 bool            `json:"api"`
+	APIAddress          string          `json:"apiAddress"`
+	Metrics             bool            `json:"metrics"`
+	MetricsAddress      string          `json:"metricsAddress"`
+	PPROF               bool            `json:"pprof"`
+	PPROFAddress        string          `json:"pprofAddress"`
+	RunOnConnect        string          `json:"runOnConnect"`
+	RunOnConnectRestart bool            `json:"runOnConnectRestart"`
+
+	// RTSP
+	RTSPDisable       bool        `json:"rtspDisable"`
+	Protocols         Protocols   `json:"protocols"`
+	Encryption        Encryption  `json:"encryption"`
+	RTSPAddress       string      `json:"rtspAddress"`
+	RTSPSAddress      string      `json:"rtspsAddress"`
+	RTPAddress        string      `json:"rtpAddress"`
+	RTCPAddress       string      `json:"rtcpAddress"`
+	MulticastIPRange  string      `json:"multicastIPRange"`
+	MulticastRTPPort  int         `json:"multicastRTPPort"`
+	MulticastRTCPPort int         `json:"multicastRTCPPort"`
+	ServerKey         string      `json:"serverKey"`
+	ServerCert        string      `json:"serverCert"`
+	AuthMethods       AuthMethods `json:"authMethods"`
+	ReadBufferSize    int         `json:"readBufferSize"`
+
+	// RTMP
+	RTMPDisable bool   `json:"rtmpDisable"`
+	RTMPAddress string `json:"rtmpAddress"`
+
+	// HLS
+	HLSDisable         bool           `json:"hlsDisable"`
+	HLSAddress         string         `json:"hlsAddress"`
+	HLSAlwaysRemux     bool           `json:"hlsAlwaysRemux"`
+	HLSSegmentCount    int            `json:"hlsSegmentCount"`
+	HLSSegmentDuration StringDuration `json:"hlsSegmentDuration"`
+	HLSAllowOrigin     string         `json:"hlsAllowOrigin"`
+
+	// paths
+	Paths map[string]*PathConf `json:"paths"`
+}
+
+// Load loads a Conf.
+func Load(fpath string) (*Conf, bool, error) {
+	conf := &Conf{}
+
+	found, err := loadFromFile(fpath, conf)
+	if err != nil {
+		return nil, false, err
 	}
-	switch conf.LogLevel {
-	case "warn":
-		conf.LogLevelParsed = logger.Warn
 
-	case "info":
-		conf.LogLevelParsed = logger.Info
+	err = loadFromEnvironment("RTSP", conf)
+	if err != nil {
+		return nil, false, err
+	}
 
-	case "debug":
-		conf.LogLevelParsed = logger.Debug
+	err = conf.CheckAndFillMissing()
+	if err != nil {
+		return nil, false, err
+	}
 
-	default:
-		return fmt.Errorf("unsupported log level: %s", conf.LogLevel)
+	return conf, found, nil
+}
+
+// CheckAndFillMissing checks the configuration for errors and fills missing parameters.
+func (conf *Conf) CheckAndFillMissing() error {
+	if conf.LogLevel == 0 {
+		conf.LogLevel = LogLevel(logger.Info)
 	}
 
 	if len(conf.LogDestinations) == 0 {
-		conf.LogDestinations = []string{"stdout"}
-	}
-	conf.LogDestinationsParsed = make(map[logger.Destination]struct{})
-	for _, dest := range conf.LogDestinations {
-		switch dest {
-		case "stdout":
-			conf.LogDestinationsParsed[logger.DestinationStdout] = struct{}{}
-
-		case "file":
-			conf.LogDestinationsParsed[logger.DestinationFile] = struct{}{}
-
-		case "syslog":
-			conf.LogDestinationsParsed[logger.DestinationSyslog] = struct{}{}
-
-		default:
-			return fmt.Errorf("unsupported log destination: %s", dest)
-		}
+		conf.LogDestinations = LogDestinations{logger.DestinationStdout: {}}
 	}
 
 	if conf.LogFile == "" {
 		conf.LogFile = "rtsp-simple-server.log"
 	}
 
+	if conf.ReadTimeout == 0 {
+		conf.ReadTimeout = 10 * StringDuration(time.Second)
+	}
+
+	if conf.WriteTimeout == 0 {
+		conf.WriteTimeout = 10 * StringDuration(time.Second)
+	}
+
+	if conf.ReadBufferCount == 0 {
+		conf.ReadBufferCount = 512
+	}
+
+	if conf.APIAddress == "" {
+		conf.APIAddress = "127.0.0.1:9997"
+	}
+
+	if conf.MetricsAddress == "" {
+		conf.MetricsAddress = "127.0.0.1:9998"
+	}
+
+	if conf.PPROFAddress == "" {
+		conf.PPROFAddress = "127.0.0.1:9999"
+	}
+
 	if len(conf.Protocols) == 0 {
-		conf.Protocols = []string{"udp", "tcp"}
-	}
-	conf.ProtocolsParsed = make(map[gortsplib.StreamProtocol]struct{})
-	for _, proto := range conf.Protocols {
-		switch proto {
-		case "udp":
-			conf.ProtocolsParsed[gortsplib.StreamProtocolUDP] = struct{}{}
-
-		case "tcp":
-			conf.ProtocolsParsed[gortsplib.StreamProtocolTCP] = struct{}{}
-
-		default:
-			return fmt.Errorf("unsupported protocol: %s", proto)
+		conf.Protocols = Protocols{
+			ProtocolUDP:       {},
+			ProtocolMulticast: {},
+			ProtocolTCP:       {},
 		}
 	}
-	if len(conf.ProtocolsParsed) == 0 {
-		return fmt.Errorf("no protocols provided")
-	}
 
-	if conf.Encryption == "" {
-		conf.Encryption = "no"
-	}
-	switch conf.Encryption {
-	case "no", "false":
-		conf.EncryptionParsed = EncryptionNo
-
-	case "optional":
-		conf.EncryptionParsed = EncryptionOptional
-
-	case "strict", "yes", "true":
-		conf.EncryptionParsed = EncryptionStrict
-
-		if _, ok := conf.ProtocolsParsed[gortsplib.StreamProtocolUDP]; ok {
-			return fmt.Errorf("encryption can't be used with the UDP stream protocol")
+	if conf.Encryption == EncryptionStrict {
+		if _, ok := conf.Protocols[ProtocolUDP]; ok {
+			return fmt.Errorf("strict encryption can't be used with the UDP stream protocol")
 		}
-
-	default:
-		return fmt.Errorf("unsupported encryption value: '%s'", conf.Encryption)
 	}
 
-	if conf.RtspPort == 0 {
-		conf.RtspPort = 8554
+	if conf.RTSPAddress == "" {
+		conf.RTSPAddress = ":8554"
 	}
-	if conf.RtspsPort == 0 {
-		conf.RtspsPort = 8555
+
+	if conf.RTSPSAddress == "" {
+		conf.RTSPSAddress = ":8555"
 	}
-	if conf.RTPPort == 0 {
-		conf.RTPPort = 8000
+
+	if conf.RTPAddress == "" {
+		conf.RTPAddress = ":8000"
 	}
-	if (conf.RTPPort % 2) != 0 {
-		return fmt.Errorf("rtp port must be even")
+
+	if conf.RTCPAddress == "" {
+		conf.RTCPAddress = ":8001"
 	}
-	if conf.RTCPPort == 0 {
-		conf.RTCPPort = 8001
+
+	if conf.MulticastIPRange == "" {
+		conf.MulticastIPRange = "224.1.0.0/16"
 	}
-	if conf.RTCPPort != (conf.RTPPort + 1) {
-		return fmt.Errorf("rtcp and rtp ports must be consecutive")
+
+	if conf.MulticastRTPPort == 0 {
+		conf.MulticastRTPPort = 8002
+	}
+
+	if conf.MulticastRTCPPort == 0 {
+		conf.MulticastRTCPPort = 8003
 	}
 
 	if conf.ServerKey == "" {
 		conf.ServerKey = "server.key"
 	}
+
 	if conf.ServerCert == "" {
 		conf.ServerCert = "server.crt"
 	}
 
 	if len(conf.AuthMethods) == 0 {
-		conf.AuthMethods = []string{"basic", "digest"}
-	}
-	for _, method := range conf.AuthMethods {
-		switch method {
-		case "basic":
-			conf.AuthMethodsParsed = append(conf.AuthMethodsParsed, headers.AuthBasic)
-
-		case "digest":
-			conf.AuthMethodsParsed = append(conf.AuthMethodsParsed, headers.AuthDigest)
-
-		default:
-			return fmt.Errorf("unsupported authentication method: %s", method)
-		}
+		conf.AuthMethods = AuthMethods{headers.AuthBasic, headers.AuthDigest}
 	}
 
-	if conf.ReadTimeout == 0 {
-		conf.ReadTimeout = 10 * time.Second
+	if conf.RTMPAddress == "" {
+		conf.RTMPAddress = ":1935"
 	}
-	if conf.WriteTimeout == 0 {
-		conf.WriteTimeout = 10 * time.Second
+
+	if conf.HLSAddress == "" {
+		conf.HLSAddress = ":8888"
 	}
-	if conf.ReadBufferCount == 0 {
-		conf.ReadBufferCount = 512
+
+	if conf.HLSSegmentCount == 0 {
+		conf.HLSSegmentCount = 3
+	}
+
+	if conf.HLSSegmentDuration == 0 {
+		conf.HLSSegmentDuration = 1 * StringDuration(time.Second)
+	}
+
+	if conf.HLSAllowOrigin == "" {
+		conf.HLSAllowOrigin = "*"
 	}
 
 	if len(conf.Paths) == 0 {
@@ -228,61 +351,11 @@ func (conf *Conf) fillAndCheck() error {
 			pconf = conf.Paths[name]
 		}
 
-		err := pconf.fillAndCheck(name)
+		err := pconf.checkAndFillMissing(name)
 		if err != nil {
 			return err
 		}
 	}
 
 	return nil
-}
-
-// Load loads a Conf.
-func Load(fpath string) (*Conf, bool, error) {
-	conf := &Conf{}
-
-	// read from file
-	found, err := func() (bool, error) {
-		// rtsp-simple-server.yml is optional
-		if fpath == "rtsp-simple-server.yml" {
-			if _, err := os.Stat(fpath); err != nil {
-				return false, nil
-			}
-		}
-
-		byts, err := ioutil.ReadFile(fpath)
-		if err != nil {
-			return true, err
-		}
-
-		if key, ok := os.LookupEnv("RTSP_CONFKEY"); ok {
-			byts, err = decrypt(key, byts)
-			if err != nil {
-				return true, err
-			}
-		}
-
-		err = yaml.Unmarshal(byts, conf)
-		if err != nil {
-			return true, err
-		}
-
-		return true, nil
-	}()
-	if err != nil {
-		return nil, false, err
-	}
-
-	// read from environment
-	err = confenv.Load("RTSP", conf)
-	if err != nil {
-		return nil, false, err
-	}
-
-	err = conf.fillAndCheck()
-	if err != nil {
-		return nil, false, err
-	}
-
-	return conf, found, nil
 }

@@ -1,6 +1,7 @@
 
-BASE_IMAGE = golang:1.15-alpine3.12
-GO_LINT_IMAGE = golangci/golangci-lint:v1.33.0
+BASE_IMAGE = golang:1.16-alpine3.13
+LINT_IMAGE = golangci/golangci-lint:v1.38.0
+NODE_IMAGE = node:14-alpine3.13
 
 .PHONY: $(shell ls)
 
@@ -12,9 +13,12 @@ help:
 	@echo "  mod-tidy       run go mod tidy"
 	@echo "  format         format source files"
 	@echo "  test           run tests"
+	@echo "  test32         run tests on a 32-bit system"
 	@echo "  lint           run linters"
-	@echo "  bench NAME=n  run bench environment"
+	@echo "  bench NAME=n   run bench environment"
 	@echo "  run            run app"
+	@echo "  apidocs-lint   run api docs linters"
+	@echo "  apidocs-gen    generate HTML from api docs"
 	@echo "  release        build release assets"
 	@echo "  dockerhub      build and push docker hub images"
 	@echo ""
@@ -26,38 +30,75 @@ $(blank)
 endef
 
 mod-tidy:
-	docker run --rm -it -v $(PWD):/s amd64/$(BASE_IMAGE) \
-	sh -c "apk add git && cd /s && GOPROXY=direct go get && go mod tidy"
+	docker run --rm -it -v $(PWD):/s -w /s $(BASE_IMAGE) \
+	sh -c "apk add git && GOPROXY=direct go get && go mod tidy"
+
+define DOCKERFILE_FORMAT
+FROM $(BASE_IMAGE)
+RUN apk add --no-cache git
+RUN GO111MODULE=on go get mvdan.cc/gofumpt
+endef
+export DOCKERFILE_FORMAT
 
 format:
-	docker run --rm -it -v $(PWD):/s amd64/$(BASE_IMAGE) \
-	sh -c "cd /s && find . -type f -name '*.go' | xargs gofmt -l -w -s"
+	echo "$$DOCKERFILE_FORMAT" | docker build -q . -f - -t temp
+	docker run --rm -it -v $(PWD):/s -w /s temp \
+	sh -c "find . -type f -name '*.go' | xargs gofumpt -l -w"
 
 define DOCKERFILE_TEST
-FROM amd64/$(BASE_IMAGE)
-RUN apk add --no-cache make docker-cli git ffmpeg gcc musl-dev
+ARG ARCH
+FROM $$ARCH/$(BASE_IMAGE)
+RUN apk add --no-cache make docker-cli ffmpeg gcc musl-dev
 WORKDIR /s
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . ./
 endef
 export DOCKERFILE_TEST
 
 test:
-	echo "$$DOCKERFILE_TEST" | docker build -q . -f - -t temp
+	echo "$$DOCKERFILE_TEST" | docker build -q . -f - -t temp --build-arg ARCH=amd64
 	docker run --rm \
+	--network=host \
 	-v /var/run/docker.sock:/var/run/docker.sock:ro \
+	-v $(PWD):/s \
 	temp \
-	make test-nodocker
+	make test-nodocker COVERAGE=1
 
-test-nodocker:
+test32:
+	echo "$$DOCKERFILE_TEST" | docker build -q . -f - -t temp --build-arg ARCH=i386
+	docker run --rm \
+	--network=host \
+	-v /var/run/docker.sock:/var/run/docker.sock:ro \
+	-v $(PWD):/s \
+	temp \
+	make test-nodocker COVERAGE=0
+
+ifeq ($(COVERAGE),1)
+TEST_INTERNAL_OPTS=-race -coverprofile=coverage-internal.txt
+TEST_CORE_OPTS=-race -coverprofile=coverage-core.txt
+endif
+
+test-internal:
+	go test -v $(TEST_INTERNAL_OPTS) \
+	./internal/conf \
+	./internal/confwatcher \
+	./internal/externalcmd \
+	./internal/hls \
+	./internal/logger \
+	./internal/rlimit \
+	./internal/rtcpsenderset \
+	./internal/rtmp
+
+test-core:
 	$(foreach IMG,$(shell echo testimages/*/ | xargs -n1 basename), \
 	docker build -q testimages/$(IMG) -t rtsp-simple-server-test-$(IMG)$(NL))
-	go test -race -v .
+	go test -v $(TEST_CORE_OPTS) ./internal/core
+
+test-nodocker: test-internal test-core
 
 lint:
 	docker run --rm -v $(PWD):/app -w /app \
-	$(GO_LINT_IMAGE) \
+	$(LINT_IMAGE) \
 	golangci-lint run -v
 
 bench:
@@ -65,8 +106,8 @@ bench:
 	docker run --rm -it -p 9999:9999 temp
 
 define DOCKERFILE_RUN
-FROM amd64/$(BASE_IMAGE)
-RUN apk add --no-cache git ffmpeg
+FROM $(BASE_IMAGE)
+RUN apk add --no-cache ffmpeg
 WORKDIR /s
 COPY go.mod go.sum ./
 RUN go mod download
@@ -79,9 +120,9 @@ endef
 export DOCKERFILE_RUN
 
 define CONFIG_RUN
-#rtspPort: 8555
-#rtpPort: 8002
-#rtcpPort: 8003
+#rtspAddress: :8555
+#rtpAddress: :8002
+#rtcpAddress: :8003
 #metrics: yes
 #pprof: yes
 
@@ -90,7 +131,7 @@ paths:
 #    runOnPublish: ffmpeg -i rtsp://localhost:$$RTSP_PORT/$$RTSP_PATH -c copy -f mpegts myfile_$$RTSP_PATH.ts
 #    readUser: test
 #    readPass: tast
-#    runOnDemand: ffmpeg -re -stream_loop -1 -i testimages/ffmpeg/emptyvideo.ts -c copy -f rtsp rtsp://localhost:$$RTSP_PORT/$$RTSP_PATH
+#    runOnDemand: ffmpeg -re -stream_loop -1 -i testimages/ffmpeg/emptyvideo.mkv -c copy -f rtsp rtsp://localhost:$$RTSP_PORT/$$RTSP_PATH
 
 #  proxied:
 #    source: rtsp://192.168.2.198:554/stream
@@ -112,8 +153,19 @@ run:
 	temp \
 	sh -c "/out"
 
+define DOCKERFILE_APIDOCS_LINT
+FROM $(NODE_IMAGE)
+RUN yarn global add @redocly/openapi-cli@1.0.0-beta.54
+endef
+export DOCKERFILE_APIDOCS_LINT
+
+apidocs-lint:
+	echo "$$DOCKERFILE_APIDOCS_LINT" | docker build . -f - -t temp
+	docker run --rm -v $(PWD)/apidocs:/s -w /s temp \
+	sh -c "openapi lint openapi.yaml"
+
 define DOCKERFILE_RELEASE
-FROM amd64/$(BASE_IMAGE)
+FROM $(BASE_IMAGE)
 RUN apk add --no-cache zip make git tar
 WORKDIR /s
 COPY go.mod go.sum ./
@@ -123,15 +175,26 @@ RUN make release-nodocker
 endef
 export DOCKERFILE_RELEASE
 
+define DOCKERFILE_APIDOCS_GEN
+FROM $(NODE_IMAGE)
+RUN yarn global add redoc-cli@0.12.2
+endef
+export DOCKERFILE_APIDOCS_GEN
+
+apidocs-gen:
+	echo "$$DOCKERFILE_APIDOCS_GEN" | docker build . -f - -t temp
+	docker run --rm -v $(PWD)/apidocs:/s -w /s temp \
+	sh -c "redoc-cli bundle openapi.yaml"
+
 release:
-	echo "$$DOCKERFILE_RELEASE" | docker build . -f - -t temp \
-	&& docker run --rm -v $(PWD):/out \
+	echo "$$DOCKERFILE_RELEASE" | docker build . -f - -t temp
+	docker run --rm -v $(PWD):/out \
 	temp sh -c "rm -rf /out/release && cp -r /s/release /out/"
 
 release-nodocker:
 	$(eval export CGO_ENABLED=0)
 	$(eval VERSION := $(shell git describe --tags))
-	$(eval GOBUILD := go build -ldflags '-X main.version=$(VERSION)')
+	$(eval GOBUILD := go build -ldflags '-X github.com/aler9/rtsp-simple-server/internal/core.version=$(VERSION)')
 	rm -rf tmp && mkdir tmp
 	rm -rf release && mkdir release
 	cp rtsp-simple-server.yml tmp/
@@ -143,10 +206,10 @@ release-nodocker:
 	tar -C tmp -czf $(PWD)/release/rtsp-simple-server_$(VERSION)_linux_amd64.tar.gz --owner=0 --group=0 rtsp-simple-server rtsp-simple-server.yml
 
 	GOOS=linux GOARCH=arm GOARM=6 $(GOBUILD) -o tmp/rtsp-simple-server
-	tar -C tmp -czf $(PWD)/release/rtsp-simple-server_$(VERSION)_linux_arm6.tar.gz --owner=0 --group=0 rtsp-simple-server rtsp-simple-server.yml
+	tar -C tmp -czf $(PWD)/release/rtsp-simple-server_$(VERSION)_linux_armv6.tar.gz --owner=0 --group=0 rtsp-simple-server rtsp-simple-server.yml
 
 	GOOS=linux GOARCH=arm GOARM=7 $(GOBUILD) -o tmp/rtsp-simple-server
-	tar -C tmp -czf $(PWD)/release/rtsp-simple-server_$(VERSION)_linux_arm7.tar.gz --owner=0 --group=0 rtsp-simple-server rtsp-simple-server.yml
+	tar -C tmp -czf $(PWD)/release/rtsp-simple-server_$(VERSION)_linux_armv7.tar.gz --owner=0 --group=0 rtsp-simple-server rtsp-simple-server.yml
 
 	GOOS=linux GOARCH=arm64 $(GOBUILD) -o tmp/rtsp-simple-server
 	tar -C tmp -czf $(PWD)/release/rtsp-simple-server_$(VERSION)_linux_arm64v8.tar.gz --owner=0 --group=0 rtsp-simple-server rtsp-simple-server.yml
@@ -164,7 +227,7 @@ COPY . ./
 ARG VERSION
 ARG OPTS
 RUN export CGO_ENABLED=0 $${OPTS} \
-	&& go build -ldflags "-X main.version=$$VERSION" -o /rtsp-simple-server
+	&& go build -ldflags "-X github.com/aler9/rtsp-simple-server/internal/core.version=$$VERSION" -o /rtsp-simple-server
 
 FROM scratch
 COPY --from=build /rtsp-simple-server /
