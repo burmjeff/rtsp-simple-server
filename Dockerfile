@@ -1,4 +1,4 @@
-FROM FROM ubuntu:rolling
+FROM ubuntu:rolling
 LABEL maintainer="burmjeff"
 
 ARG GST_VERSION=1.18.0
