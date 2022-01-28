@@ -226,7 +226,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y $b
   apt-get autoremove -y
 
 #Fetch and install rtsp-simple-server
-RUN wget https://github.com/aler9/rtsp-simple-server/releases/download/v0.17.6/rtsp-simple-server_v0.17.6_linux_amd64.tar.gz -O rtsp-simple-server.tar.gz && \
+RUN wget https://github.com/aler9/rtsp-simple-server/releases/download/v0.17.14/rtsp-simple-server_v0.17.14_linux_amd64.tar.gz -O rtsp-simple-server.tar.gz && \
     tar zxfvp rtsp-simple-server.tar.gz && \
     chmod +x rtsp-simple-server && \
     mv rtsp-simple-server /usr/bin && \
